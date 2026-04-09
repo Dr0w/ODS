@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import platform
 import socket
+import subprocess
 import time
 from pathlib import Path
 from typing import Sequence
@@ -12,7 +15,8 @@ from numpy.typing import NDArray
 
 HOST = "127.0.0.1"
 PORT = 5100
-COMMAND = "START_DETECTION"
+START_COMMAND = "START_DETECTION"
+LIST_CAMERAS_COMMAND = "LIST_CAMERAS"
 WINDOW_NAME = "ODS Face and Eye Detection"
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
@@ -20,21 +24,141 @@ FRAME_ARRAY = NDArray[np.uint8]
 Rect = tuple[int, int, int, int]
 
 
-def open_camera() -> tuple[cv2.VideoCapture, int]:
-    for camera_index in (0, 1):
+def try_open_camera(camera_index: int) -> cv2.VideoCapture | None:
+    system_name = platform.system()
+    if system_name == "Darwin":
+        capture = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
+    elif system_name == "Windows":
+        capture = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
         capture = cv2.VideoCapture(camera_index)
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        if capture.isOpened():
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    if capture.isOpened():
+        return capture
+    capture.release()
+    return None
+
+
+def discover_macos_cameras() -> list[dict[str, int | str]]:
+    if platform.system() != "Darwin":
+        return []
+
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPCameraDataType", "-json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    raw_cameras = payload.get("SPCameraDataType", [])
+    if not isinstance(raw_cameras, list):
+        return []
+
+    cameras: list[dict[str, int | str]] = []
+    for index, item in enumerate(raw_cameras):
+        if not isinstance(item, dict):
+            continue
+        name = item.get("_name")
+        if isinstance(name, str) and name.strip():
+            cameras.append({"index": index, "name": name.strip()})
+    return cameras
+
+
+def discover_windows_cameras() -> list[dict[str, int | str]]:
+    if platform.system() != "Windows":
+        return []
+
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        (
+            "Get-CimInstance Win32_PnPEntity | "
+            "Where-Object { $_.PNPClass -eq 'Image' -or $_.Service -match 'usbvideo' } | "
+            "Select-Object -ExpandProperty Name | ConvertTo-Json -Compress"
+        ),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(payload, str):
+        names = [payload]
+    elif isinstance(payload, list) and all(isinstance(item, str) for item in payload):
+        names = payload
+    else:
+        return []
+
+    return [{"index": index, "name": name.strip()} for index, name in enumerate(names) if name.strip()]
+
+
+def available_cameras() -> list[dict[str, int | str]]:
+    system_name = platform.system()
+    if system_name == "Darwin":
+        cameras = discover_macos_cameras()
+    elif system_name == "Windows":
+        cameras = discover_windows_cameras()
+    else:
+        cameras = []
+
+    if cameras:
+        return cameras
+    return [{"index": 0, "name": "Default camera"}]
+
+
+def log_available_cameras() -> None:
+    cameras = available_cameras()
+    if not cameras:
+        print("No cameras discovered.")
+        return
+
+    print("Discovered cameras:")
+    for camera in cameras:
+        camera_index = camera.get("index")
+        camera_name = camera.get("name")
+        print(f"- {camera_name} (index {camera_index})")
+
+
+def open_camera(camera_index: int | None = None) -> tuple[cv2.VideoCapture, int]:
+    if camera_index is not None:
+        capture = try_open_camera(camera_index)
+        if capture is not None:
             return capture, camera_index
-        capture.release()
-    raise RuntimeError("Could not open a webcam on index 0 or 1.")
+        raise RuntimeError(f"Could not open camera index {camera_index}.")
+
+    for discovered_camera in available_cameras():
+        detected_camera_index = discovered_camera["index"]
+        if not isinstance(detected_camera_index, int):
+            continue
+        capture = try_open_camera(detected_camera_index)
+        if capture is not None:
+            return capture, detected_camera_index
+    raise RuntimeError("Could not open the selected camera.")
 
 
 def cascade_path(filename: str) -> str:
+    cv2_module_file = cv2.__file__
+    if cv2_module_file is None:
+        raise RuntimeError("OpenCV module path is unavailable; cannot locate cascade data files.")
+
     candidate_paths = [
         Path(__file__).resolve().parent / filename,
-        Path(cv2.__file__).resolve().parent / "data" / filename,
+        Path(cv2_module_file).resolve().parent / "data" / filename,
     ]
 
     for path in candidate_paths:
@@ -221,6 +345,22 @@ def pick_best_eye_pair(eyes: list[Rect], face_width: int, face_height: int) -> l
     return best_pair
 
 
+def pick_best_single_eye(eyes: list[Rect], face_width: int, face_height: int) -> list[Rect]:
+    if not eyes:
+        return []
+
+    best_eye = sorted(
+        eyes,
+        key=lambda eye: (
+            eye[2] * eye[3],
+            -abs((eye[0] + eye[2] / 2) - face_width * 0.5),
+            -abs((eye[1] + eye[3] / 2) - face_height * 0.25),
+        ),
+        reverse=True,
+    )[0]
+    return [best_eye]
+
+
 def validate_frontal_face(
     face: Rect,
     gray: FRAME_ARRAY,
@@ -231,7 +371,11 @@ def validate_frontal_face(
     raw_eyes = detect_eyes(face_gray, eye_cascade)
     valid_eyes = filter_eye_candidates(raw_eyes, w, h)
     best_pair = pick_best_eye_pair(valid_eyes, w, h)
-    return len(best_pair) == 2, best_pair
+    if len(best_pair) == 2:
+        return True, best_pair
+
+    best_single_eye = pick_best_single_eye(valid_eyes, w, h)
+    return len(best_single_eye) == 1, best_single_eye
 
 
 def validate_profile_face(
@@ -247,12 +391,7 @@ def validate_profile_face(
     if not valid_eyes:
         return False, []
 
-    best_eye = sorted(
-        valid_eyes,
-        key=lambda eye: (eye[2] * eye[3], -abs((eye[1] + eye[3] / 2) - h * 0.25)),
-        reverse=True,
-    )[0]
-    return True, [best_eye]
+    return True, pick_best_single_eye(valid_eyes, w, h)
 
 
 def detect_faces_and_valid_eyes(
@@ -312,8 +451,38 @@ def draw_hud(
         )
 
 
-def detect_faces_and_eyes() -> str:
-    capture, camera_index = open_camera()
+def draw_face_outline(frame: FRAME_ARRAY, face: Rect) -> None:
+    x, y, w, h = face
+    center = (x + w // 2, y + h // 2)
+    axes = (max(1, int(w * 0.42)), max(1, int(h * 0.52)))
+    cv2.ellipse(frame, center, axes, 0, 0, 360, (0, 220, 0), 2, cv2.LINE_AA)
+
+
+def draw_eye_outline(frame: FRAME_ARRAY, face: Rect, eye: Rect) -> None:
+    x, y, _, _ = face
+    ex, ey, ew, eh = eye
+    center = (x + ex + ew // 2, y + ey + eh // 2)
+    axes = (max(1, int(ew * 0.5)), max(1, int(eh * 0.38)))
+    cv2.ellipse(frame, center, axes, 0, 0, 360, (20, 80, 255), 2, cv2.LINE_AA)
+
+
+def close_detection_window() -> None:
+    try:
+        cv2.destroyWindow(WINDOW_NAME)
+    except cv2.error:
+        pass
+
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error:
+        pass
+
+    # Give macOS a brief moment to tear down the AVFoundation window cleanly.
+    time.sleep(0.05)
+
+
+def detect_faces_and_eyes(camera_index: int | None = None) -> str:
+    capture, active_camera_index = open_camera(camera_index)
     cascades = load_cascades()
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -345,7 +514,7 @@ def detect_faces_and_eyes() -> str:
             peak_faces_in_frame = max(peak_faces_in_frame, frame_face_count)
 
             for (x, y, w, h), eyes in accepted_faces:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 0), 2)
+                draw_face_outline(frame, (x, y, w, h))
                 cv2.putText(
                     frame,
                     "face",
@@ -358,31 +527,68 @@ def detect_faces_and_eyes() -> str:
                 )
 
                 for ex, ey, ew, eh in eyes:
-                    eye_x1 = x + ex
-                    eye_y1 = y + ey
-                    eye_x2 = eye_x1 + ew
-                    eye_y2 = eye_y1 + eh
-                    cv2.rectangle(frame, (eye_x1, eye_y1), (eye_x2, eye_y2), (20, 80, 255), 2)
+                    draw_eye_outline(frame, (x, y, w, h), (ex, ey, ew, eh))
 
             elapsed = max(time.perf_counter() - started_at, 1e-6)
             fps = frames_processed / elapsed
-            draw_hud(frame, frame_face_count, frame_eye_count, frames_processed, fps, camera_index)
+            draw_hud(
+                frame,
+                frame_face_count,
+                frame_eye_count,
+                frames_processed,
+                fps,
+                active_camera_index,
+            )
 
             cv2.imshow(WINDOW_NAME, frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            try:
+                window_visible = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) >= 1
+            except cv2.error:
+                window_visible = False
+            if key == ord("q") or key == 27 or not window_visible:
                 break
     finally:
         capture.release()
-        cv2.destroyAllWindows()
+        close_detection_window()
 
     elapsed = max(time.perf_counter() - started_at, 1e-6)
     average_fps = frames_processed / elapsed
     return (
-        f"Detection completed using camera index {camera_index}. "
+        f"Detection completed using camera index {active_camera_index}. "
         f"Frames processed: {frames_processed}, total faces detected: {total_faces_detected}, "
         f"total eyes detected: {total_eyes_detected}, peak faces in a frame: {peak_faces_in_frame}, "
         f"average FPS: {average_fps:.1f}."
     )
+
+
+def parse_camera_index(request: str) -> int | None:
+    parts = request.split(maxsplit=1)
+    if len(parts) == 1:
+        return None
+    camera_index_text = parts[1].strip()
+    if not camera_index_text:
+        return None
+    try:
+        return int(camera_index_text)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid camera index: {camera_index_text}") from exc
+
+
+def handle_request(request: str) -> str:
+    if request == LIST_CAMERAS_COMMAND:
+        payload = {
+            "cameras": available_cameras(),
+        }
+        return json.dumps(payload)
+
+    if request == START_COMMAND or request.startswith(f"{START_COMMAND} "):
+        try:
+            return detect_faces_and_eyes(parse_camera_index(request))
+        except Exception as exc:
+            return f"Detection failed: {exc}"
+
+    return f"Unsupported command: {request or '<empty>'}"
 
 
 def start_server(host: str = HOST, port: int = PORT) -> None:
@@ -392,7 +598,11 @@ def start_server(host: str = HOST, port: int = PORT) -> None:
     server_socket.listen(1)
 
     print(f"Server is listening on {host}:{port}")
-    print(f"Send '{COMMAND}' from client.py to start local detection. Press 'q' to stop.")
+    log_available_cameras()
+    print(
+        f"Send '{START_COMMAND}' from client.py to start local detection. "
+        f"Use '{LIST_CAMERAS_COMMAND}' to inspect camera indices. Press 'q' to stop."
+    )
 
     try:
         while True:
@@ -400,15 +610,7 @@ def start_server(host: str = HOST, port: int = PORT) -> None:
             with client_socket:
                 print(f"Received connection from {client_address[0]}:{client_address[1]}")
                 request = client_socket.recv(4096).decode("utf-8").strip()
-
-                if request != COMMAND:
-                    response = f"Unsupported command: {request or '<empty>'}"
-                else:
-                    try:
-                        response = detect_faces_and_eyes()
-                    except Exception as exc:
-                        response = f"Detection failed: {exc}"
-
+                response = handle_request(request)
                 client_socket.sendall(response.encode("utf-8"))
     finally:
         server_socket.close()
